@@ -90,6 +90,9 @@ class GradCam:
 
         if index == None:
             index = np.argmax(output.cpu().data.numpy())
+        else:
+        	indices = np.argsort(output.cpu().data.numpy())[0]
+        	index = indices[index]
 
         one_hot = np.zeros((1, output.size()[-1]), dtype = np.float32)
         one_hot[0][index] = 1
@@ -182,10 +185,11 @@ class GuidedBackpropReLUModel:
 
 def get_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--use-cuda', action='store_true', default=False,
-                        help='Use NVIDIA GPU acceleration')
+    parser.add_argument('--use-cuda', action='store_false', default=True,
+                        help='Do not use NVIDIA GPU acceleration')
     parser.add_argument('--image-path', type=str, default='./examples/both.png',
                         help='Input image path')
+    parser.add_argument('--index', type=str, default='None')
     args = parser.parse_args()
     args.use_cuda = args.use_cuda and torch.cuda.is_available()
     if args.use_cuda:
@@ -217,7 +221,7 @@ if __name__ == '__main__':
 
     # If None, returns the map for the highest scoring category.
     # Otherwise, targets the requested index.
-    target_index = None
+    target_index = eval(args.index)
 
     mask = grad_cam(input, target_index)
 
