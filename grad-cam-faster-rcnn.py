@@ -5,6 +5,9 @@ from torchvision import models
 from torchvision import utils
 import cv2
 import sys
+sys.path.append('/home/user/deep-learning/my-faster-rcnn')
+from lib.faster_r_cnn import FasterRCNN
+from lib.consts import voc_names
 import numpy as np
 import argparse
 
@@ -36,25 +39,26 @@ class ModelOutputs():
     3. Gradients from intermeddiate targetted layers. """
     def __init__(self, model, target_layers):
         self.model = model
-        self.feature_extractor = FeatureExtractor(self.model.features, target_layers)
+        self.feature_extractor = FeatureExtractor(self.model.CNN, target_layers)
 
     def get_gradients(self):
         return self.feature_extractor.gradients
 
     def __call__(self, x):
         target_activations, output  = self.feature_extractor(x)
-        output = output.view(output.size(0), -1)
-        output = self.model.classifier(output)
-        return target_activations, output
+        RPN_cls, RPN_reg = self.model.RPN(output)
+        roi_scores, roi_coords, proposals = self.model.test_RCNN(x, {'scale': (1,)}, output,
+                                                                 RPN_cls, RPN_reg, fetch_tensors=True)
+
+        return target_activations, (RPN_cls, RPN_reg, roi_scores, roi_coords, proposals)
 
 def preprocess_image(img):
-    means=[0.485, 0.456, 0.406]
-    stds=[0.229, 0.224, 0.225]
+    img = np.float32(img)
+    means=[122.7717, 115.9465, 102.9801]
 
-    preprocessed_img = img.copy()[: , :, ::-1]
+    preprocessed_img = img.copy()
     for i in range(3):
         preprocessed_img[:, :, i] = preprocessed_img[:, :, i] - means[i]
-        preprocessed_img[:, :, i] = preprocessed_img[:, :, i] / stds[i]
     preprocessed_img = \
         np.ascontiguousarray(np.transpose(preprocessed_img, (2, 0, 1)))
     preprocessed_img = torch.from_numpy(preprocessed_img)
@@ -62,12 +66,22 @@ def preprocess_image(img):
     input = Variable(preprocessed_img, requires_grad = True)
     return input
 
-def show_cam_on_image(img, mask):
+def show_cam_on_image(img, mask, proposal, shape):
     heatmap = cv2.applyColorMap(np.uint8(255*mask), cv2.COLORMAP_JET)
-    heatmap = np.float32(heatmap) / 255
+    heatmap = np.float32(heatmap)
     cam = heatmap + np.float32(img)
     cam = cam / np.max(cam)
-    cv2.imwrite("cam.jpg", np.uint8(255 * cam))
+    cam = np.uint8(255 * cam)
+    # cam = cv2.resize(img, shape)
+    cv2.imwrite("cam.jpg", cam)
+    import matplotlib.pyplot as plt
+    plt.imshow(cam[:,:,::-1])
+    bbox = proposal
+    plt.gca().add_patch(
+        plt.Rectangle((bbox[0], bbox[1]),
+                      bbox[2], bbox[3], fill=False)
+    )
+    plt.show()
 
 class GradCam:
     def __init__(self, model, target_layer_names, use_cuda):
@@ -88,22 +102,31 @@ class GradCam:
         else:
             features, output = self.extractor(input)
 
-        if index == None:
-            index = np.argmax(output.cpu().data.numpy())
-        else:
-            indices = np.argsort(output.cpu().data.numpy())[0]
-            index = indices[index]
+        RPN_cls, RPN_reg, roi_scores, roi_coords, proposals = output
+        output = roi_scores
+        output_np = output.cpu().data.numpy()
+        output_np[:, 0] = 0
 
-        one_hot = np.zeros((1, output.size()[-1]), dtype = np.float32)
-        one_hot[0][index] = 1
+        if index == None:
+            index = np.unravel_index(np.argmax(output_np), output_np.shape)
+            proposal = proposals[:, index[0]]
+        else:
+            indices = np.unravel_index(np.argsort(output_np.reshape(-1)), output_np.shape)
+            index = tuple(i[index] for i in indices)
+        print("Class:", voc_names[index[1]])
+        proposal = proposals[:, index[0]]
+
+        one_hot = np.zeros_like(output_np, dtype=np.float32)
+        one_hot[index] = 1
         one_hot = Variable(torch.from_numpy(one_hot), requires_grad = True)
         if self.cuda:
             one_hot = torch.sum(one_hot.cuda() * output)
         else:
             one_hot = torch.sum(one_hot * output)
 
-        self.model.features.zero_grad()
-        self.model.classifier.zero_grad()
+        self.model.CNN.zero_grad()
+        self.model.RPN.zero_grad()
+        self.model.RCNN.zero_grad()
         one_hot.backward()
 
         grads_val = self.extractor.get_gradients()[-1].cpu().data.numpy()
@@ -118,10 +141,10 @@ class GradCam:
             cam += w * target[i, :, :]
 
         cam = np.maximum(cam, 0)
-        cam = cv2.resize(cam, (224, 224))
+        cam = cv2.resize(cam, (600, 600))
         cam = cam - np.min(cam)
         cam = cam / np.max(cam)
-        return cam
+        return cam, proposal
 
 class GuidedBackpropReLU(Function):
 
@@ -137,7 +160,10 @@ class GuidedBackpropReLU(Function):
 
         positive_mask_1 = (input > 0).type_as(grad_output)
         positive_mask_2 = (grad_output > 0).type_as(grad_output)
-        grad_input = torch.addcmul(torch.zeros(input.size()).type_as(input), torch.addcmul(torch.zeros(input.size()).type_as(input), grad_output, positive_mask_1), positive_mask_2)
+        grad_input = torch.addcmul(torch.zeros(input.size()).type_as(input),
+                                   torch.addcmul(torch.zeros(input.size()).type_as(input),
+                                                 grad_output, positive_mask_1),
+                                   positive_mask_2)
 
         return grad_input
 
@@ -149,10 +175,13 @@ class GuidedBackpropReLUModel:
         if self.cuda:
             self.model = model.cuda()
 
+        # TODO: Start from here
+
         # replace ReLU with GuidedBackpropReLU
-        for idx, module in self.model.features._modules.items():
-            if module.__class__.__name__ == 'ReLU':
-                self.model.features._modules[idx] = GuidedBackpropReLU()
+        for child in self.model.children():
+            for idx, module in child._modules.items():
+                if module.__class__.__name__ == 'ReLU':
+                    child._modules[idx] = GuidedBackpropReLU()
 
     def forward(self, input):
         return self.model(input)
@@ -212,28 +241,32 @@ if __name__ == '__main__':
     # Can work with any model, but it assumes that the model has a 
     # feature method, and a classifier method,
     # as in the VGG models in torchvision.
-    grad_cam = GradCam(model = models.vgg19(pretrained=True), \
-                    target_layer_names = ["35"], use_cuda=args.use_cuda)
+    grad_cam = GradCam(
+        model=FasterRCNN('/home/user/deep-learning/my-faster-rcnn/results/result-31-n/param-16-80176.pth'),
+        target_layer_names = ["29"], use_cuda=args.use_cuda)
 
     img = cv2.imread(args.image_path, 1)
-    img = np.float32(cv2.resize(img, (224, 224))) / 255
+    shape = img.shape[:2]
+    img = cv2.resize(img, (600, 600))
     input = preprocess_image(img)
 
     # If None, returns the map for the highest scoring category.
     # Otherwise, targets the requested index.
     target_index = eval(args.index)
 
-    mask = grad_cam(input, target_index)
+    mask, proposal = grad_cam(input, target_index)
 
-    show_cam_on_image(img, mask)
+    show_cam_on_image(img, mask, proposal, shape)
 
-    gb_model = GuidedBackpropReLUModel(model = models.vgg19(pretrained=True), use_cuda=args.use_cuda)
-    gb = gb_model(input, index=target_index)
-    utils.save_image(torch.from_numpy(gb), 'gb.jpg')
-
-    cam_mask = np.zeros(gb.shape)
-    for i in range(0, gb.shape[0]):
-        cam_mask[i, :, :] = mask
-
-    cam_gb = np.multiply(cam_mask, gb)
-    utils.save_image(torch.from_numpy(cam_gb), 'cam_gb.jpg')
+    # gb_model = GuidedBackpropReLUModel(
+    #     model=FasterRCNN('/home/user/deep-learning/my-faster-rcnn/results/result-31-n/param-16-80176.pth'),
+    #     use_cuda=args.use_cuda)
+    # gb = gb_model(input, index=target_index)
+    # utils.save_image(torch.from_numpy(gb), 'gb.jpg')
+    
+    # cam_mask = np.zeros(gb.shape)
+    # for i in range(0, gb.shape[0]):
+    #     cam_mask[i, :, :] = mask
+    
+    # cam_gb = np.multiply(cam_mask, gb)
+    # utils.save_image(torch.from_numpy(cam_gb), 'cam_gb.jpg')
